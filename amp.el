@@ -4,7 +4,7 @@
 
 ;; Author: Keegan Carruthers-Smith <keegan.csmith@gmail.com>
 ;; Author: Amp <amp@ampcode.com>
-;; Version: 0.0.2
+;; Version: 0.0.3
 ;; Package-Requires: ((emacs "28.1") (websocket "1.12"))
 ;; Keywords: amp, ai, agent, assistant
 ;; URL: https://github.com/keegancsmith/amp.el
@@ -28,12 +28,21 @@
 ;; position, your text selection, and diagnostics.
 ;;
 ;; Based on the amp.nvim plugin architecture.
+;;
+;; Multi-project support:
+;; - One Amp server per project root (detected via project.el)
+;; - Non-project buffers are supported via a special nil project
+;; - Use `amp-start' to start a server for the current project
+;; - Use `amp-stop' to stop the server for the current project
+;; - Use `amp-stop-all' to stop all servers
+;; - Use `amp-status' to check status (with prefix arg for all servers)
 
 ;;; Code:
 
 (require 'json)
 (require 'websocket)
 (require 'cl-lib)
+(require 'project)
 
 ;;; Configuration
 
@@ -52,34 +61,34 @@ One of: trace, debug, info, warn, error."
                  (const :tag "Error" error))
   :group 'amp)
 
+;;; Project State Structure
+
+(cl-defstruct amp--project-state
+  root
+  server
+  port
+  auth-token
+  clients
+  connected
+  latest-selection
+  latest-visible-files)
+
 ;;; State
 
-(defvar amp--server nil
-  "The WebSocket server instance.")
-
-(defvar amp--port nil
-  "The port the server is running on.")
-
-(defvar amp--auth-token nil
-  "Authentication token for the server.")
-
-(defvar amp--clients nil
-  "List of connected clients.")
-
-(defvar amp--connected nil
-  "Whether any clients are connected.")
-
-(defvar amp--latest-selection nil
-  "The latest selection that was broadcast.")
-
-(defvar amp--latest-visible-files nil
-  "The latest visible files that were broadcast.")
+(defvar amp--projects (make-hash-table :test #'equal)
+  "Map project root (string or nil) to `amp--project-state'.")
 
 (defvar amp--selection-timer nil
   "Timer for debounced selection updates.")
 
 (defvar amp--event-listeners (make-hash-table :test 'equal)
   "Event listeners by event name.")
+
+(defvar amp--hooks-installed nil
+  "Whether global tracking hooks are installed.")
+
+(defvar amp--cleanup-hook-installed nil
+  "Whether the kill-emacs cleanup hook is installed.")
 
 ;;; Logging
 
@@ -108,6 +117,38 @@ One of: trace, debug, info, warn, error."
         (when (memq level '(warn error))
           (message "[Amp %s] %s" (upcase (symbol-name level)) formatted-msg))))))
 
+;;; Project Detection
+
+(defun amp--current-project-root ()
+  "Return the normalized project root for the current buffer, or nil.
+Returns nil for non-project buffers, which is a valid project key."
+  (when-let* ((proj (project-current nil))
+              (root (project-root proj)))
+    (expand-file-name root)))
+
+(defun amp--describe-project (root)
+  "Return a human-readable description for ROOT (which may be nil)."
+  (or (and root (abbreviate-file-name root))
+      "non-project buffers"))
+
+;;; Project Registry
+
+(defun amp--get-project-state (root)
+  "Get project state for ROOT, or nil if not running."
+  (gethash root amp--projects))
+
+(defun amp--put-project-state (state)
+  "Register STATE in the project registry."
+  (puthash (amp--project-state-root state) state amp--projects))
+
+(defun amp--remove-project-state (root)
+  "Remove project state for ROOT from registry."
+  (remhash root amp--projects))
+
+(defun amp--map-projects (fn)
+  "Call FN with each project state in the registry."
+  (maphash (lambda (_root state) (funcall fn state)) amp--projects))
+
 ;;; Utility Functions
 
 (defun amp--get-data-home ()
@@ -135,15 +176,18 @@ One of: trace, debug, info, warn, error."
       (setq token (concat token (string (aref chars (random (length chars)))))))
     token))
 
-(defun amp--create-lockfile (port auth-token)
-  "Create a lockfile for PORT with AUTH-TOKEN."
+(defun amp--create-lockfile (port auth-token root)
+  "Create a lockfile for PORT with AUTH-TOKEN and project ROOT.
+ROOT may be nil for non-project buffers, in which case default-directory is used."
   (let* ((lock-dir (amp--lock-dir))
          (lockfile-path (expand-file-name (format "%d.json" port) lock-dir))
+         (workspace (file-name-as-directory
+                     (expand-file-name (or root default-directory))))
          (lock-data (json-encode
                      `((port . ,port)
                        (authToken . ,auth-token)
                        (pid . ,(emacs-pid))
-                       (workspaceFolders . ["/"])
+                       (workspaceFolders . [,workspace])
                        (ideName . ,(format "Emacs %s" emacs-version))))))
     (unless (file-directory-p lock-dir)
       (make-directory lock-dir t))
@@ -187,8 +231,8 @@ One of: trace, debug, info, warn, error."
 
 ;;; WebSocket Server
 
-(defun amp--handle-websocket-message (ws frame)
-  "Handle incoming WebSocket message from WS with FRAME."
+(defun amp--handle-websocket-message (state ws frame)
+  "Handle incoming WebSocket message for project STATE from WS with FRAME."
   (let* ((message (websocket-frame-text frame))
          (parsed (condition-case err
                      (json-read-from-string message)
@@ -197,10 +241,10 @@ One of: trace, debug, info, warn, error."
                     nil)))
          (request (and parsed (alist-get 'clientRequest parsed))))
     (when request
-      (amp--handle-ide-request ws request))))
+      (amp--handle-ide-request state ws request))))
 
-(defun amp--handle-ide-request (ws request)
-  "Handle IDE REQUEST from websocket WS."
+(defun amp--handle-ide-request (state ws request)
+  "Handle IDE REQUEST for project STATE from websocket WS."
   (let ((id (alist-get 'id request)))
     (cond
      ;; Ping request
@@ -235,21 +279,21 @@ One of: trace, debug, info, warn, error."
           (if (not full-content)
               (amp--send-ide ws (amp--wrap-error id '((code . -32602) (message . "Invalid params") (data . "editFile requires fullContent parameter"))))
             (condition-case err
-            (let* ((full-path (expand-file-name path))
-            (bufnr (or (find-buffer-visiting full-path)
-            (find-file-noselect full-path))))
-            (with-current-buffer bufnr
-            (let ((saved-point (point))
-                  (saved-window-start (and (get-buffer-window bufnr)
-                                          (window-start (get-buffer-window bufnr)))))
-                (erase-buffer)
-                       (insert full-content)
-                       (goto-char (min saved-point (point-max)))
-                       (when saved-window-start
-                         (set-window-start (get-buffer-window bufnr)
+                (let* ((full-path (expand-file-name path))
+                       (bufnr (or (find-buffer-visiting full-path)
+                                  (find-file-noselect full-path))))
+                  (with-current-buffer bufnr
+                    (let ((saved-point (point))
+                          (saved-window-start (and (get-buffer-window bufnr)
+                                                   (window-start (get-buffer-window bufnr)))))
+                      (erase-buffer)
+                      (insert full-content)
+                      (goto-char (min saved-point (point-max)))
+                      (when saved-window-start
+                        (set-window-start (get-buffer-window bufnr)
                                           (min saved-window-start (point-max))))
-                       (save-buffer)))
-                   (amp--send-ide ws (amp--wrap-response id `((editFile . ((success . t) (message . ,(format "Edit applied successfully to %s" path)) (appliedChanges . t)))))))
+                      (save-buffer)))
+                  (amp--send-ide ws (amp--wrap-response id `((editFile . ((success . t) (message . ,(format "Edit applied successfully to %s" path)) (appliedChanges . t)))))))
               (error
                (amp--send-ide ws (amp--wrap-response id `((editFile . ((success . :json-false) (message . ,(error-message-string err)))))))))))))
 
@@ -275,32 +319,50 @@ One of: trace, debug, info, warn, error."
         (error
          (amp--log 'warn "server" "Failed to send message: %s" (error-message-string err)))))))
 
-(defun amp--broadcast-ide (notification)
-  "Broadcast IDE NOTIFICATION to all connected clients."
-  (when amp--clients
-    (let ((json-message (json-encode (amp--wrap-notification notification))))
-      (dolist (client amp--clients)
-        (when (websocket-openp client)
-          (condition-case err
-              (websocket-send-text client json-message)
-            (error
-             (amp--log 'warn "server" "Failed to broadcast to client: %s" (error-message-string err)))))))))
+(defun amp--project-broadcast-ide (state notification)
+  "Broadcast NOTIFICATION to all clients of project STATE."
+  (let ((json-message (json-encode notification)))
+    (dolist (ws (amp--project-state-clients state))
+      (when (websocket-openp ws)
+        (condition-case err
+            (websocket-send-text ws json-message)
+          (error
+           (amp--log 'warn "server" "Failed to broadcast: %s"
+                     (error-message-string err))))))))
 
-(defun amp--on-client-connect (ws)
-  "Handle client connection from WS."
-  (push ws amp--clients)
-  (setq amp--connected t)
-  (amp--log 'info "server" "Client connected")
+(defun amp--broadcast-ide (payload)
+  "Broadcast PAYLOAD to the current project's server.
+Resolves the project from the current buffer."
+  (let* ((root (amp--current-project-root))
+         (state (amp--get-project-state root)))
+    (unless state
+      (user-error "No Amp server running for %s" (amp--describe-project root)))
+    (amp--project-broadcast-ide state (amp--wrap-notification payload))))
+
+(defun amp--on-client-connect (state ws)
+  "Handle client connection for project STATE from WS."
+  (push ws (amp--project-state-clients state))
+  (setf (amp--project-state-connected state) t)
+  (amp--log 'info "server" "Client connected to project %s"
+            (amp--describe-project (amp--project-state-root state)))
   (amp--emit 'client-connect ws)
-  ;; Send initial state after short delay
-  (run-with-timer 0.05 nil #'amp--send-initial-state))
+  (run-with-timer 0.05 nil
+                  (lambda ()
+                    (amp--send-initial-state-for-project state))))
 
-(defun amp--on-client-disconnect (ws)
-  "Handle client disconnection from WS."
-  (setq amp--clients (delq ws amp--clients))
-  (when (null amp--clients)
-    (setq amp--connected nil)
-    (amp--log 'info "server" "Disconnected from Amp (no clients)"))
+(defun amp--send-initial-state-for-project (state)
+  "Send initial visible-files and selection state for project STATE."
+  (amp--broadcast-visible-files-for-project state t)
+  (amp--update-selection-for-project state))
+
+(defun amp--on-client-disconnect (state ws)
+  "Handle client disconnection for project STATE from WS."
+  (setf (amp--project-state-clients state)
+        (delq ws (amp--project-state-clients state)))
+  (when (null (amp--project-state-clients state))
+    (setf (amp--project-state-connected state) nil)
+    (amp--log 'info "server" "Disconnected from Amp for project %s"
+              (amp--describe-project (amp--project-state-root state))))
   (amp--emit 'client-disconnect ws))
 
 ;;; Selection Tracking
@@ -318,12 +380,12 @@ One of: trace, debug, info, warn, error."
              (line (1- (line-number-at-pos pos)))
              (col (- pos (line-beginning-position)))
              (line-content (buffer-substring-no-properties
-                           (line-beginning-position)
-                           (line-end-position))))
+                            (line-beginning-position)
+                            (line-end-position))))
         `((text . "")
           (fileUrl . ,uri)
           (selection . ((start . ((line . ,line) (character . ,col)))
-                       (end . ((line . ,line) (character . ,col)))))
+                        (end . ((line . ,line) (character . ,col)))))
           (lineContent . ,line-content))))))
 
 (defun amp--get-visual-selection ()
@@ -340,7 +402,7 @@ One of: trace, debug, info, warn, error."
       `((text . ,text)
         (fileUrl . ,uri)
         (selection . ((start . ((line . ,start-line) (character . ,start-col)))
-                     (end . ((line . ,end-line) (character . ,end-col)))))))))
+                      (end . ((line . ,end-line) (character . ,end-col)))))))))
 
 (defun amp--get-current-selection ()
   "Get the current selection (visual or cursor)."
@@ -352,24 +414,46 @@ One of: trace, debug, info, warn, error."
   (let ((sel (alist-get 'selection selection)))
     `((uri . ,(alist-get 'fileUrl selection))
       (selections . [((range . ((startLine . ,(alist-get 'line (alist-get 'start sel)))
-                               (startCharacter . ,(alist-get 'character (alist-get 'start sel)))
-                               (endLine . ,(alist-get 'line (alist-get 'end sel)))
-                               (endCharacter . ,(alist-get 'character (alist-get 'end sel)))))
-                     (content . ,(alist-get 'text selection)))]))))
-
-(defun amp--selection-changed-p (new-selection)
-  "Check if NEW-SELECTION is different from the last broadcast selection."
-  (not (equal new-selection amp--latest-selection)))
+                                (startCharacter . ,(alist-get 'character (alist-get 'start sel)))
+                                (endLine . ,(alist-get 'line (alist-get 'end sel)))
+                                (endCharacter . ,(alist-get 'character (alist-get 'end sel)))))
+                      (content . ,(alist-get 'text selection)))]))))
 
 (defun amp--update-selection ()
-  "Update and broadcast the current selection."
-  (when amp--server
-    (let ((selection (amp--get-current-selection)))
-      (when (and selection (amp--selection-changed-p selection))
-        (setq amp--latest-selection selection)
-        (let ((ide-notification (amp--selection-to-ide-format selection)))
-          (amp--broadcast-ide `((selectionDidChange . ,ide-notification)))
-          (amp--log 'debug "selection" "Selection changed: %s" (alist-get 'uri ide-notification)))))))
+  "Update and broadcast selection for the current buffer's project.
+Works for both project buffers and non-project buffers (nil project)."
+  (let* ((root (amp--current-project-root))
+         (state (amp--get-project-state root))
+         (selection (amp--get-current-selection)))
+    (when (and state selection)
+      (let ((last (amp--project-state-latest-selection state)))
+        (unless (equal selection last)
+          (setf (amp--project-state-latest-selection state) selection)
+          (let ((ide-notification (amp--selection-to-ide-format selection)))
+            (amp--project-broadcast-ide
+             state
+             (amp--wrap-notification `((selectionDidChange . ,ide-notification))))
+            (amp--log 'debug "selection" "Selection changed for %s"
+                      (amp--describe-project root))))))))
+
+(defun amp--update-selection-for-project (state)
+  "Update and broadcast current selection for project STATE."
+  (let* ((root (amp--project-state-root state))
+         (selection nil))
+    (cl-block find-selection
+      (dolist (window (window-list))
+        (let* ((buf (window-buffer window))
+               (buf-root (with-current-buffer buf (amp--current-project-root))))
+          (when (equal buf-root root)
+            (with-current-buffer buf
+              (setq selection (amp--get-current-selection)))
+            (cl-return-from find-selection)))))
+    (when selection
+      (setf (amp--project-state-latest-selection state) selection)
+      (let ((ide-notification (amp--selection-to-ide-format selection)))
+        (amp--project-broadcast-ide
+         state
+         (amp--wrap-notification `((selectionDidChange . ,ide-notification))))))))
 
 (defun amp--debounced-selection-update ()
   "Debounced selection update."
@@ -380,31 +464,49 @@ One of: trace, debug, info, warn, error."
 
 ;;; Visible Files Tracking
 
-(defun amp--get-visible-files ()
-  "Get all currently visible files."
-  (let ((uris nil)
-        (seen (make-hash-table :test 'equal)))
-    (dolist (window (window-list))
-      (let* ((buf (window-buffer window))
-             (name (buffer-file-name buf)))
-        (when (and name (not (gethash name seen)))
-          (puthash name t seen)
-          (push (concat "file://" (expand-file-name name)) uris))))
+(defun amp--get-visible-files-for-project (root)
+  "Return list of file:// URIs for visible files in project ROOT.
+ROOT may be nil for non-project files."
+  (let ((seen (make-hash-table :test 'equal))
+        (uris nil))
+    (dolist (frame (frame-list))
+      (dolist (window (window-list frame 'no-minibuf))
+        (let* ((buf (window-buffer window))
+               (file (buffer-file-name buf)))
+          (when file
+            (let ((buf-root (with-current-buffer buf
+                              (amp--current-project-root))))
+              (when (equal buf-root root)
+                (let ((abs (expand-file-name file)))
+                  (unless (gethash abs seen)
+                    (puthash abs t seen)
+                    (push (concat "file://" abs) uris)))))))))
     (nreverse uris)))
 
-(defun amp--visible-files-changed-p (new-files)
-  "Check if NEW-FILES is different from the last broadcast files."
-  (not (equal (sort (copy-sequence new-files) #'string<)
-              (sort (copy-sequence amp--latest-visible-files) #'string<))))
+(defun amp--broadcast-visible-files-for-project (state &optional force)
+  "Broadcast visible files for project STATE if changed or FORCE is non-nil."
+  (let* ((root (amp--project-state-root state))
+         (files (amp--get-visible-files-for-project root))
+         (last (amp--project-state-latest-visible-files state)))
+    (when (or force
+              (not (equal (sort (copy-sequence files) #'string<)
+                          (sort (copy-sequence (or last '())) #'string<))))
+      (setf (amp--project-state-latest-visible-files state) files)
+      (amp--project-broadcast-ide
+       state
+       (amp--wrap-notification
+        `((visibleFilesDidChange . ((uris . ,(vconcat files)))))))
+      (amp--log 'debug "visible-files"
+                "Project %s: visible files changed, count: %d"
+                (amp--describe-project root) (length files)))))
 
-(defun amp--broadcast-visible-files (&optional force)
-  "Broadcast visible files if changed or FORCE is non-nil."
-  (when amp--server
-    (let ((files (amp--get-visible-files)))
-      (when (or force (amp--visible-files-changed-p files))
-        (setq amp--latest-visible-files files)
-        (amp--broadcast-ide `((visibleFilesDidChange . ((uris . ,(vconcat files))))))
-        (amp--log 'debug "visible-files" "Visible files changed, count: %d" (length files))))))
+(defun amp--broadcast-visible-files (&optional _force)
+  "Broadcast visible files for each active project if changed."
+  (when (> (hash-table-count amp--projects) 0)
+    (maphash
+     (lambda (_root state)
+       (amp--broadcast-visible-files-for-project state))
+     amp--projects)))
 
 ;;; Diagnostics
 
@@ -432,8 +534,8 @@ One of: trace, debug, info, warn, error."
            (end-line (progn (goto-char end) (1- (line-number-at-pos))))
            (end-col (- end (line-beginning-position)))
            (line-content (buffer-substring-no-properties
-                         (line-beginning-position)
-                         (line-end-position))))
+                          (line-beginning-position)
+                          (line-end-position))))
       `((range . ((startLine . ,beg-line)
                   (startCharacter . ,beg-col)
                   (endLine . ,end-line)
@@ -449,24 +551,21 @@ One of: trace, debug, info, warn, error."
 Returns an array of entries with uri and diagnostics."
   (let ((abs-path (expand-file-name path))
         (entries-by-uri (make-hash-table :test 'equal)))
-    ;; Collect diagnostics from all buffers
     (dolist (buf (buffer-list))
       (when-let ((buf-name (buffer-file-name buf)))
         (let ((abs-buf-name (expand-file-name buf-name)))
-          ;; Check if buffer path starts with the requested path (prefix match)
           (when (string-prefix-p abs-path abs-buf-name)
             (with-current-buffer buf
               (when (and (featurep 'flymake)
-                        (bound-and-true-p flymake-mode))
+                         (bound-and-true-p flymake-mode))
                 (let ((diags (mapcar #'amp--diagnostic-to-protocol
-                                   (flymake-diagnostics))))
+                                     (flymake-diagnostics))))
                   (when diags
                     (let ((uri (concat "file://" abs-buf-name)))
                       (puthash uri
-                              `((uri . ,uri)
-                                (diagnostics . ,(vconcat diags)))
-                              entries-by-uri))))))))))
-    ;; Convert hash table to array
+                               `((uri . ,uri)
+                                 (diagnostics . ,(vconcat diags)))
+                               entries-by-uri))))))))))
     (let ((entries nil))
       (maphash (lambda (_key value)
                  (push value entries))
@@ -475,162 +574,223 @@ Returns an array of entries with uri and diagnostics."
 
 ;;; Hooks
 
-(defun amp--setup-hooks ()
-  "Set up hooks for tracking selection, visible files, and diagnostics."
-  (add-hook 'post-command-hook #'amp--debounced-selection-update)
-  (add-hook 'window-configuration-change-hook #'amp--broadcast-visible-files)
-  (add-hook 'buffer-list-update-hook #'amp--broadcast-visible-files))
+(defun amp--ensure-hooks ()
+  "Install global hooks if not already installed."
+  (unless amp--hooks-installed
+    (add-hook 'post-command-hook #'amp--debounced-selection-update)
+    (add-hook 'window-configuration-change-hook #'amp--broadcast-visible-files)
+    (add-hook 'buffer-list-update-hook #'amp--broadcast-visible-files)
+    (setq amp--hooks-installed t)))
 
-(defun amp--remove-hooks ()
-  "Remove all Amp hooks."
-  (remove-hook 'post-command-hook #'amp--debounced-selection-update)
-  (remove-hook 'window-configuration-change-hook #'amp--broadcast-visible-files)
-  (remove-hook 'buffer-list-update-hook #'amp--broadcast-visible-files))
+(defun amp--ensure-cleanup-hook ()
+  "Install kill-emacs cleanup hook if not already installed."
+  (unless amp--cleanup-hook-installed
+    (add-hook 'kill-emacs-hook #'amp--cleanup-on-exit)
+    (setq amp--cleanup-hook-installed t)))
+
+(defun amp--maybe-remove-hooks ()
+  "Remove global hooks if no projects are running."
+  (when (and amp--hooks-installed
+             (= (hash-table-count amp--projects) 0))
+    (remove-hook 'post-command-hook #'amp--debounced-selection-update)
+    (remove-hook 'window-configuration-change-hook #'amp--broadcast-visible-files)
+    (remove-hook 'buffer-list-update-hook #'amp--broadcast-visible-files)
+    (setq amp--hooks-installed nil)))
+
+(defun amp--maybe-remove-cleanup-hook ()
+  "Remove kill-emacs cleanup hook if no projects are running."
+  (when (and amp--cleanup-hook-installed
+             (= (hash-table-count amp--projects) 0))
+    (remove-hook 'kill-emacs-hook #'amp--cleanup-on-exit)
+    (setq amp--cleanup-hook-installed nil)))
 
 ;;; Server Management
 
 (defun amp--cleanup-on-exit ()
-  "Clean up Amp server on Emacs exit."
-  (when amp--server
-    (amp--remove-lockfile amp--port)
-    (websocket-server-close amp--server)))
-
-(defun amp--send-initial-state ()
-  "Send initial state to newly connected clients."
-  (amp--broadcast-visible-files t)
-  (amp--update-selection))
+  "Clean up all Amp servers on Emacs exit."
+  (amp--map-projects
+   (lambda (state)
+     (amp--remove-lockfile (amp--project-state-port state))
+     (when (amp--project-state-server state)
+       (websocket-server-close (amp--project-state-server state)))))
+  (clrhash amp--projects))
 
 ;;;###autoload
 (defun amp-start ()
-  "Start the Amp WebSocket server."
+  "Start the Amp WebSocket server for the current project.
+If not in a project, starts a server for non-project buffers."
   (interactive)
-  (when amp--server
-    (amp--log 'warn "server" "Server already running on port %d" amp--port)
-    (user-error "Amp server already running on port %d" amp--port))
+  (let* ((root (amp--current-project-root))
+         (existing (amp--get-project-state root)))
+    (when existing
+      (user-error "Amp server already running for %s (port %d)"
+                  (amp--describe-project root)
+                  (amp--project-state-port existing)))
 
-  (let* ((auth-token (amp--generate-auth-token))
-         (port (+ 10000 (random 55535)))
-         (server nil))
-    (setq amp--auth-token auth-token)
+    (let* ((auth-token (amp--generate-auth-token))
+           (port (+ 10000 (random 55535)))
+           (state (make-amp--project-state
+                   :root root
+                   :auth-token auth-token
+                   :port port
+                   :clients nil
+                   :connected nil
+                   :latest-selection nil
+                   :latest-visible-files nil))
+           (server nil))
 
-    ;; Create WebSocket server
-    (condition-case err
-        (setq server
-              (websocket-server
-               port
-               :host 'local
-               :on-open #'amp--on-client-connect
-               :on-message #'amp--handle-websocket-message
-               :on-close #'amp--on-client-disconnect
-               :on-error (lambda (_ws type err)
-                          (amp--log 'error "server" "WebSocket error (%s): %s" type err))))
-      (error
-       (amp--log 'error "server" "Failed to start server: %s" (error-message-string err))
-       (user-error "Failed to start Amp server: %s" (error-message-string err))))
+      (condition-case err
+          (setq server
+                (websocket-server
+                 port
+                 :host 'local
+                 :on-open (lambda (ws) (amp--on-client-connect state ws))
+                 :on-message (lambda (ws frame)
+                               (amp--handle-websocket-message state ws frame))
+                 :on-close (lambda (ws) (amp--on-client-disconnect state ws))
+                 :on-error (lambda (_ws type err)
+                             (amp--log 'error "server"
+                                       "WebSocket error (%s): %s" type err))))
+        (error
+         (user-error "Failed to start Amp server: %s" (error-message-string err))))
 
-    (setq amp--server server
-          amp--port port
-          amp--clients nil
-          amp--connected nil)
+      (setf (amp--project-state-server state) server)
 
-    ;; Create lockfile
-    (condition-case err
-        (amp--create-lockfile port auth-token)
-      (error
-       (websocket-server-close server)
-       (setq amp--server nil
-             amp--port nil
-             amp--auth-token nil)
-       (amp--log 'error "server" "Failed to create lockfile: %s" (error-message-string err))
-       (user-error "Failed to create lockfile: %s" (error-message-string err))))
+      (condition-case err
+          (amp--create-lockfile port auth-token root)
+        (error
+         (websocket-server-close server)
+         (user-error "Failed to create lockfile: %s" (error-message-string err))))
 
-    ;; Set up tracking hooks
-    (amp--setup-hooks)
+      (amp--put-project-state state)
+      (amp--ensure-hooks)
+      (amp--ensure-cleanup-hook)
 
-    ;; Add kill-emacs-hook to clean up on exit
-    (add-hook 'kill-emacs-hook #'amp--cleanup-on-exit)
+      (run-with-timer 0.2 nil
+                      (lambda ()
+                        (amp--project-broadcast-ide
+                         state
+                         (amp--wrap-notification
+                          `((pluginMetadata . ((version . "0.1.0"))))))))
 
-    ;; Send plugin metadata after delay
-    (run-with-timer 0.2 nil
-                    (lambda ()
-                      (amp--broadcast-ide
-                       `((pluginMetadata . ((version . "0.1.0")))))))
-
-    (amp--log 'info "server" "Server started on port %d" port)
-    (message "Amp server started on port %d" port)))
+      (amp--log 'info "server" "Server started for %s on port %d"
+                (amp--describe-project root) port)
+      (message "Amp server started for %s on port %d"
+               (amp--describe-project root) port))))
 
 ;;;###autoload
 (defun amp-stop ()
-  "Stop the Amp WebSocket server."
+  "Stop the Amp WebSocket server for the current project.
+If not in a project, stops the server for non-project buffers."
   (interactive)
-  (unless amp--server
-    (amp--log 'info "server" "Server is not running")
-    (user-error "Amp server is not running"))
+  (let* ((root (amp--current-project-root))
+         (state (amp--get-project-state root)))
+    (unless state
+      (user-error "No Amp server running for %s" (amp--describe-project root)))
 
-  (amp--remove-lockfile amp--port)
-  (amp--remove-hooks)
+    (amp--remove-lockfile (amp--project-state-port state))
+    (when (amp--project-state-server state)
+      (websocket-server-close (amp--project-state-server state)))
+    (amp--remove-project-state root)
+    (amp--maybe-remove-hooks)
+    (amp--maybe-remove-cleanup-hook)
 
-  (websocket-server-close amp--server)
-
-  (setq amp--server nil
-        amp--port nil
-        amp--auth-token nil
-        amp--clients nil
-        amp--connected nil
-        amp--latest-selection nil
-        amp--latest-visible-files nil)
-
-  (amp--log 'info "server" "Server stopped")
-  (message "Amp server stopped"))
+    (amp--log 'info "server" "Server stopped for %s" (amp--describe-project root))
+    (message "Amp server stopped for %s" (amp--describe-project root))))
 
 ;;;###autoload
-(defun amp-status ()
-  "Show the status of the Amp server."
+(defun amp-stop-all ()
+  "Stop all Amp WebSocket servers for all projects."
   (interactive)
-  (if amp--server
-      (let ((status (if amp--connected "connected" "waiting for clients")))
-        (message "Amp server running on port %d (%s)" amp--port status)
-        (amp--log 'info "status" "Server running on port %d (%s)" amp--port status)
-        (amp--log 'info "status" "Visible files: %d" (length amp--latest-visible-files))
-        (when amp--last-error
-          (amp--log 'info "status" "Last error: %s" (caddr amp--last-error))))
-    (message "Amp server is not running")
-    (amp--log 'info "status" "Server is not running")))
+  (let ((count (hash-table-count amp--projects)))
+    (amp--map-projects
+     (lambda (state)
+       (amp--remove-lockfile (amp--project-state-port state))
+       (when (amp--project-state-server state)
+         (websocket-server-close (amp--project-state-server state)))))
+    (clrhash amp--projects)
+    (amp--maybe-remove-hooks)
+    (amp--maybe-remove-cleanup-hook)
+    (message "Stopped %d Amp server(s)" count)))
+
+;;;###autoload
+(defun amp-status (&optional all)
+  "Show status of Amp server for current project.
+With prefix argument ALL, show all running servers."
+  (interactive "P")
+  (if all
+      (if (= (hash-table-count amp--projects) 0)
+          (message "No Amp servers running")
+        (let ((lines nil))
+          (maphash (lambda (root state)
+                     (push (cons (or root "")
+                                 (format "  %s: port %d (%s)"
+                                         (amp--describe-project root)
+                                         (amp--project-state-port state)
+                                         (if (amp--project-state-connected state)
+                                             "connected" "waiting")))
+                           lines))
+                   amp--projects)
+          (setq lines (sort lines (lambda (a b) (string< (car a) (car b)))))
+          (message "Amp servers:\n%s"
+                   (string-join (mapcar #'cdr lines) "\n"))))
+    (let* ((root (amp--current-project-root))
+           (state (amp--get-project-state root)))
+      (if state
+          (message "Amp server for %s: port %d (%s)"
+                   (amp--describe-project root)
+                   (amp--project-state-port state)
+                   (if (amp--project-state-connected state)
+                       "connected" "waiting"))
+        (message "No Amp server running for %s" (amp--describe-project root))))))
 
 ;;;###autoload
 (defun amp-send-message (message)
-  "Send MESSAGE to the Amp agent."
+  "Send MESSAGE to the Amp agent for the current project."
   (interactive "sMessage: ")
-  (unless amp--server
-    (user-error "Amp server is not running"))
-  (amp--broadcast-ide `((userSentMessage . ((message . ,message)))))
-  (amp--log 'debug "message" "Message sent to agent"))
+  (let* ((root (amp--current-project-root))
+         (state (amp--get-project-state root)))
+    (unless state
+      (user-error "No Amp server running for %s" (amp--describe-project root)))
+    (amp--project-broadcast-ide
+     state
+     (amp--wrap-notification `((userSentMessage . ((message . ,message))))))
+    (amp--log 'debug "message" "Message sent to agent for %s"
+              (amp--describe-project root))))
 
 ;;;###autoload
 (defun amp-send-region (start end)
-  "Send region between START and END to Amp agent."
+  "Send region between START and END to Amp agent for the current project."
   (interactive "r")
   (amp-send-message (buffer-substring-no-properties start end)))
 
 ;;;###autoload
 (defun amp-send-to-prompt (text)
-  "Send TEXT to append to the Amp prompt."
+  "Send TEXT to append to the Amp prompt for the current project."
   (interactive "sText: ")
-  (unless amp--server
-    (user-error "Amp server is not running"))
-  (amp--broadcast-ide `((appendToPrompt . ((message . ,text)))))
-  (amp--log 'debug "message" "Text appended to prompt"))
+  (let* ((root (amp--current-project-root))
+         (state (amp--get-project-state root)))
+    (unless state
+      (user-error "No Amp server running for %s" (amp--describe-project root)))
+    (amp--project-broadcast-ide
+     state
+     (amp--wrap-notification `((appendToPrompt . ((message . ,text))))))
+    (amp--log 'debug "message" "Text appended to prompt for %s"
+              (amp--describe-project root))))
 
 ;;;###autoload
 (define-minor-mode amp-mode
-  "Minor mode for Amp IDE integration."
+  "Minor mode for Amp IDE integration.
+DEPRECATED: Use `amp-start' and `amp-stop' directly instead.
+This mode is provided for backwards compatibility but does not
+work well with multi-project support."
   :global t
   :group 'amp
   :lighter " Amp"
   (if amp-mode
-      (unless amp--server
+      (unless (amp--get-project-state (amp--current-project-root))
         (amp-start))
-    (when amp--server
+    (when (amp--get-project-state (amp--current-project-root))
       (amp-stop))))
 
 (provide 'amp)
