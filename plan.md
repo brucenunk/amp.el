@@ -54,6 +54,10 @@ Use `project.el` to detect the current project root and maintain a hash table `r
 (defun amp--remove-project-state (root)
   "Remove project state for ROOT from registry."
   (remhash root amp--projects))
+
+(defun amp--map-projects (fn)
+  "Call FN with each project state in the registry."
+  (maphash (lambda (_root state) (funcall fn state)) amp--projects))
 ```
 
 ### 1.3 Current Project Helpers
@@ -68,10 +72,13 @@ Returns nil for non-project buffers, which is a valid project key."
 
 (defun amp--describe-project (root)
   "Return a human-readable description for ROOT (which may be nil)."
-  (or root "non-project buffers"))
+  (or (and root (abbreviate-file-name root))
+      "non-project buffers"))
 ```
 
 **Note:** We no longer have `amp--current-project-root-or-error` since `nil` is a valid project key representing all non-project buffers.
+
+**Nil-project semantics:** The `nil` project represents a *single global bucket* for all non-project buffers across Emacs. When `amp-start` is run for a nil-project, the lockfile's `workspaceFolders` is set to the `default-directory` at that moment. This means CLI invocations from other non-project directories may not match this server. This is acceptable for casual use where users typically start one nil-project server per ad-hoc directory.
 
 ### 1.4 Variables to Migrate
 
@@ -85,7 +92,9 @@ Returns nil for non-project buffers, which is a valid project key."
 | `amp--latest-selection` | `(amp--project-state-latest-selection state)` |
 | `amp--latest-visible-files` | `(amp--project-state-latest-visible-files state)` |
 
-**Remain global:** `amp--event-listeners`, `amp--log-buffer`, `amp--last-error`, `amp-log-level`
+**Remain global:** `amp--event-listeners`, `amp--log-buffer`, `amp--last-error`, `amp-log-level`, `amp--selection-timer`
+
+**Note:** `amp--selection-timer` remains global (one timer for all projects). The timer's callback (`amp--update-selection`) resolves the appropriate project state from the current buffer.
 
 ---
 
@@ -181,7 +190,7 @@ If not in a project, starts a server for non-project buffers."
       ;; Register state and ensure hooks
       (amp--put-project-state state)
       (amp--ensure-hooks)
-      (add-hook 'kill-emacs-hook #'amp--cleanup-on-exit)
+      (amp--ensure-cleanup-hook)
       
       ;; Send plugin metadata
       (run-with-timer 0.2 nil
@@ -214,6 +223,7 @@ If not in a project, stops the server for non-project buffers."
       (websocket-server-close (amp--project-state-server state)))
     (amp--remove-project-state root)
     (amp--maybe-remove-hooks)
+    (amp--maybe-remove-cleanup-hook)
     
     (amp--log 'info "server" "Server stopped for %s" (amp--describe-project root))
     (message "Amp server stopped for %s" (amp--describe-project root))))
@@ -226,13 +236,14 @@ If not in a project, stops the server for non-project buffers."
   "Stop all Amp WebSocket servers for all projects."
   (interactive)
   (let ((count (hash-table-count amp--projects)))
-    (maphash (lambda (_root state)
-               (amp--remove-lockfile (amp--project-state-port state))
-               (when (amp--project-state-server state)
-                 (websocket-server-close (amp--project-state-server state))))
-             amp--projects)
+    (amp--map-projects
+     (lambda (state)
+       (amp--remove-lockfile (amp--project-state-port state))
+       (when (amp--project-state-server state)
+         (websocket-server-close (amp--project-state-server state)))))
     (clrhash amp--projects)
     (amp--maybe-remove-hooks)
+    (amp--maybe-remove-cleanup-hook)
     (message "Stopped %d Amp server(s)" count)))
 ```
 
@@ -242,6 +253,9 @@ If not in a project, stops the server for non-project buffers."
 (defvar amp--hooks-installed nil
   "Whether global tracking hooks are installed.")
 
+(defvar amp--cleanup-hook-installed nil
+  "Whether the kill-emacs cleanup hook is installed.")
+
 (defun amp--ensure-hooks ()
   "Install global hooks if not already installed."
   (unless amp--hooks-installed
@@ -249,6 +263,12 @@ If not in a project, stops the server for non-project buffers."
     (add-hook 'window-configuration-change-hook #'amp--broadcast-visible-files)
     (add-hook 'buffer-list-update-hook #'amp--broadcast-visible-files)
     (setq amp--hooks-installed t)))
+
+(defun amp--ensure-cleanup-hook ()
+  "Install kill-emacs cleanup hook if not already installed."
+  (unless amp--cleanup-hook-installed
+    (add-hook 'kill-emacs-hook #'amp--cleanup-on-exit)
+    (setq amp--cleanup-hook-installed t)))
 
 (defun amp--maybe-remove-hooks ()
   "Remove global hooks if no projects are running."
@@ -258,6 +278,13 @@ If not in a project, stops the server for non-project buffers."
     (remove-hook 'window-configuration-change-hook #'amp--broadcast-visible-files)
     (remove-hook 'buffer-list-update-hook #'amp--broadcast-visible-files)
     (setq amp--hooks-installed nil)))
+
+(defun amp--maybe-remove-cleanup-hook ()
+  "Remove kill-emacs cleanup hook if no projects are running."
+  (when (and amp--cleanup-hook-installed
+             (= (hash-table-count amp--projects) 0))
+    (remove-hook 'kill-emacs-hook #'amp--cleanup-on-exit)
+    (setq amp--cleanup-hook-installed nil)))
 ```
 
 ### 3.5 Cleanup on Emacs Exit
@@ -265,11 +292,11 @@ If not in a project, stops the server for non-project buffers."
 ```elisp
 (defun amp--cleanup-on-exit ()
   "Clean up all Amp servers on Emacs exit."
-  (maphash (lambda (_root state)
-             (amp--remove-lockfile (amp--project-state-port state))
-             (when (amp--project-state-server state)
-               (websocket-server-close (amp--project-state-server state))))
-           amp--projects)
+  (amp--map-projects
+   (lambda (state)
+     (amp--remove-lockfile (amp--project-state-port state))
+     (when (amp--project-state-server state)
+       (websocket-server-close (amp--project-state-server state)))))
   (clrhash amp--projects))
 ```
 
@@ -316,7 +343,7 @@ If a file is in a subdirectory that could match multiple projects, `project-curr
 
 ## 5. Per-Project Tracking
 
-### 5.1 Project Broadcast Primitive
+### 5.1 Project Broadcast Primitives
 
 ```elisp
 (defun amp--project-broadcast-ide (state notification)
@@ -329,7 +356,18 @@ If a file is in a subdirectory that could match multiple projects, `project-curr
           (error
            (amp--log 'warn "server" "Failed to broadcast: %s"
                      (error-message-string err))))))))
+
+(defun amp--broadcast-ide (payload)
+  "Broadcast PAYLOAD to the current project's server.
+Resolves the project from the current buffer."
+  (let* ((root (amp--current-project-root))
+         (state (amp--get-project-state root)))
+    (unless state
+      (user-error "No Amp server running for %s" (amp--describe-project root)))
+    (amp--project-broadcast-ide state payload)))
 ```
+
+**Usage:** Server-internal broadcasts should use `amp--project-broadcast-ide` with an explicit `state`. User-facing commands can use `amp--broadcast-ide` which resolves the current project automatically.
 
 ### 5.2 Selection Updates
 
@@ -392,7 +430,7 @@ ROOT may be nil for non-project files."
              `((visibleFilesDidChange . ((uris . ,(vconcat files)))))))
            (amp--log 'debug "visible-files"
                      "Project %s: visible files changed, count: %d"
-                     root (length files)))))
+                     (amp--describe-project root) (length files)))))
      amp--projects)))
 ```
 
@@ -429,6 +467,8 @@ ROOT may be nil for non-project buffers, in which case default-directory is used
 - `workspaceFolders` is set to `[default-directory]` for non-project buffers (nil project)
 - This allows the Amp CLI to match the correct server based on working directory
 
+**CLI matching note:** The CLI typically picks the server whose `workspaceFolders` entry is the longest matching prefix of its working directory. For nil-project servers, the `workspaceFolders` is locked to the `default-directory` at `amp-start` time. CLI invocations from other directories may not match this server. Coordinate with CLI behavior to ensure proper matching semantics.
+
 ---
 
 ## 7. WebSocket Callbacks
@@ -441,12 +481,17 @@ Server callbacks need closures capturing the project state:
   (push ws (amp--project-state-clients state))
   (setf (amp--project-state-connected state) t)
   (amp--log 'info "server" "Client connected to project %s"
-            (amp--project-state-root state))
+            (amp--describe-project (amp--project-state-root state)))
   (amp--emit 'client-connect ws)
-  ;; Send initial state
+  ;; Send initial state for this project
   (run-with-timer 0.05 nil
                   (lambda ()
                     (amp--send-initial-state-for-project state))))
+
+(defun amp--send-initial-state-for-project (state)
+  "Send initial visible-files and selection state for project STATE."
+  (amp--broadcast-visible-files-for-project state t)
+  (amp--update-selection-for-project state))
 
 (defun amp--on-client-disconnect (state ws)
   "Handle client disconnection for project STATE from WS."
@@ -455,7 +500,7 @@ Server callbacks need closures capturing the project state:
   (when (null (amp--project-state-clients state))
     (setf (amp--project-state-connected state) nil)
     (amp--log 'info "server" "Disconnected from Amp for project %s"
-              (amp--project-state-root state)))
+              (amp--describe-project (amp--project-state-root state))))
   (amp--emit 'client-disconnect ws))
 
 (defun amp--handle-websocket-message (state ws frame)
@@ -481,14 +526,18 @@ With prefix argument ALL, show all running servers."
           (message "No Amp servers running")
         (let ((lines nil))
           (maphash (lambda (root state)
-                     (push (format "  %s: port %d (%s)"
-                                   (amp--describe-project root)
-                                   (amp--project-state-port state)
-                                   (if (amp--project-state-connected state)
-                                       "connected" "waiting"))
+                     (push (cons (or root "")  ; sort key
+                                 (format "  %s: port %d (%s)"
+                                         (amp--describe-project root)
+                                         (amp--project-state-port state)
+                                         (if (amp--project-state-connected state)
+                                             "connected" "waiting")))
                            lines))
                    amp--projects)
-          (message "Amp servers:\n%s" (string-join (nreverse lines) "\n"))))
+          ;; Sort alphabetically by root for predictable output
+          (setq lines (sort lines (lambda (a b) (string< (car a) (car b)))))
+          (message "Amp servers:\n%s"
+                   (string-join (mapcar #'cdr lines) "\n"))))
     ;; Show current project only
     (let* ((root (amp--current-project-root))  ; nil is valid
            (state (amp--get-project-state root)))
@@ -559,9 +608,11 @@ With prefix argument ALL, show all running servers."
 - [ ] Update `amp-send-region` for project context
 
 ### Phase 6: Cleanup
-- [ ] Remove obsolete global variables
-- [ ] Decide `amp-mode` fate (deprecate or make project-aware)
+- [ ] Remove obsolete global variables (`amp--server`, `amp--port`, `amp--auth-token`, `amp--clients`, `amp--connected`, `amp--latest-selection`, `amp--latest-visible-files`)
+- [ ] Deprecate `amp-mode` - recommend `amp-start`/`amp-stop` as canonical lifecycle commands
 - [ ] Update documentation
+
+**Note on `amp-mode`:** Given the "manual lifecycle only" principle, `amp-mode` should be deprecated. The most predictable behavior in a multi-project world is to use explicit `amp-start`/`amp-stop` commands. Keeping `amp-mode` would either need to auto-start servers (violating the manual principle) or become a no-op toggle affecting only logging/UX.
 
 ### Testing
 - [ ] Test: start server for project A
