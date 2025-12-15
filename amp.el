@@ -440,13 +440,14 @@ Works for both project buffers and non-project buffers (nil project)."
   "Update and broadcast current selection for project STATE."
   (let* ((root (amp--project-state-root state))
          (selection nil))
-    (dolist (window (window-list))
-      (let* ((buf (window-buffer window))
-             (buf-root (with-current-buffer buf (amp--current-project-root))))
-        (when (equal buf-root root)
-          (with-current-buffer buf
-            (setq selection (amp--get-current-selection)))
-          (cl-return))))
+    (cl-block find-selection
+      (dolist (window (window-list))
+        (let* ((buf (window-buffer window))
+               (buf-root (with-current-buffer buf (amp--current-project-root))))
+          (when (equal buf-root root)
+            (with-current-buffer buf
+              (setq selection (amp--get-current-selection)))
+            (cl-return-from find-selection)))))
     (when selection
       (setf (amp--project-state-latest-selection state) selection)
       (let ((ide-notification (amp--selection-to-ide-format selection)))
