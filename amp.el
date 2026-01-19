@@ -61,6 +61,22 @@ One of: trace, debug, info, warn, error."
                  (const :tag "Error" error))
   :group 'amp)
 
+;;; Public Hooks and Event Struct
+
+(cl-defstruct amp-client-connection-event
+  "Event passed to client connection hooks."
+  root)
+
+(defvar amp-client-connect-hook nil
+  "Hook run when Amp CLI connects.
+Functions are called with one argument: an `amp-client-connection-event'.
+Use `amp-client-connection-event-root' to get the project root (may be nil).")
+
+(defvar amp-client-disconnect-hook nil
+  "Hook run when Amp CLI disconnects.
+Functions are called with one argument: an `amp-client-connection-event'.
+Use `amp-client-connection-event-root' to get the project root (may be nil).")
+
 ;;; Session State Structure
 
 (cl-defstruct amp--session-state
@@ -209,6 +225,24 @@ ROOT may be nil for non-project buffers, in which case default-directory is used
   (let ((listeners (gethash event-name amp--event-listeners)))
     (puthash event-name (cons callback listeners) amp--event-listeners)))
 
+(defun amp--off (event-name callback)
+  "Remove CALLBACK from EVENT-NAME listeners.
+EVENT-NAME should be a symbol. Callbacks are compared by identity (eq)."
+  (let ((listeners (gethash event-name amp--event-listeners)))
+    (when listeners
+      (puthash event-name (delq callback listeners) amp--event-listeners))))
+
+(defun amp--once (event-name callback)
+  "Register CALLBACK for EVENT-NAME, auto-removing after first call.
+The callback is removed after it fires once. Note that removal during
+an emit only affects future emits, not the current iteration."
+  (let ((wrapper nil))
+    (setq wrapper
+          (lambda (&rest args)
+            (amp--off event-name wrapper)
+            (apply callback args)))
+    (amp--on event-name wrapper)))
+
 (defun amp--emit (event-name &rest args)
   "Emit EVENT-NAME with ARGS to all registered listeners."
   (let ((listeners (gethash event-name amp--event-listeners)))
@@ -346,6 +380,14 @@ Resolves the project from the current buffer."
   (amp--log 'info "server" "Client connected to project %s"
             (amp--describe-project (amp--session-state-root state)))
   (amp--emit 'client-connect ws)
+  (let ((event (make-amp-client-connection-event
+                :root (amp--session-state-root state))))
+    (condition-case err
+        (run-hook-with-args 'amp-client-connect-hook event)
+      (error
+       (amp--log 'error "hooks"
+                 "Error in amp-client-connect-hook: %s"
+                 (error-message-string err)))))
   (run-with-timer 0.05 nil
                   (lambda ()
                     (amp--send-initial-state-for-project state))))
@@ -363,7 +405,15 @@ Resolves the project from the current buffer."
     (setf (amp--session-state-connected state) nil)
     (amp--log 'info "server" "Disconnected from Amp for project %s"
               (amp--describe-project (amp--session-state-root state))))
-  (amp--emit 'client-disconnect ws))
+  (amp--emit 'client-disconnect ws)
+  (let ((event (make-amp-client-connection-event
+                :root (amp--session-state-root state))))
+    (condition-case err
+        (run-hook-with-args 'amp-client-disconnect-hook event)
+      (error
+       (amp--log 'error "hooks"
+                 "Error in amp-client-disconnect-hook: %s"
+                 (error-message-string err))))))
 
 ;;; Selection Tracking
 
