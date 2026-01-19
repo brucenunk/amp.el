@@ -61,9 +61,25 @@ One of: trace, debug, info, warn, error."
                  (const :tag "Error" error))
   :group 'amp)
 
-;;; Project State Structure
+;;; Public Hooks and Event Struct
 
-(cl-defstruct amp--project-state
+(cl-defstruct amp-client-connection-event
+  "Event passed to client connection hooks."
+  root)
+
+(defvar amp-client-connect-hook nil
+  "Hook run when Amp CLI connects.
+Functions are called with one argument: an `amp-client-connection-event'.
+Use `amp-client-connection-event-root' to get the project root (may be nil).")
+
+(defvar amp-client-disconnect-hook nil
+  "Hook run when Amp CLI disconnects.
+Functions are called with one argument: an `amp-client-connection-event'.
+Use `amp-client-connection-event-root' to get the project root (may be nil).")
+
+;;; Session State Structure
+
+(cl-defstruct amp--session-state
   root
   server
   port
@@ -76,7 +92,7 @@ One of: trace, debug, info, warn, error."
 ;;; State
 
 (defvar amp--projects (make-hash-table :test #'equal)
-  "Map project root (string or nil) to `amp--project-state'.")
+  "Map project root (string or nil) to `amp--session-state'.")
 
 (defvar amp--selection-timer nil
   "Timer for debounced selection updates.")
@@ -139,7 +155,7 @@ Returns nil for non-project buffers, which is a valid project key."
 
 (defun amp--put-project-state (state)
   "Register STATE in the project registry."
-  (puthash (amp--project-state-root state) state amp--projects))
+  (puthash (amp--session-state-root state) state amp--projects))
 
 (defun amp--remove-project-state (root)
   "Remove project state for ROOT from registry."
@@ -208,6 +224,24 @@ ROOT may be nil for non-project buffers, in which case default-directory is used
   "Register CALLBACK for EVENT-NAME."
   (let ((listeners (gethash event-name amp--event-listeners)))
     (puthash event-name (cons callback listeners) amp--event-listeners)))
+
+(defun amp--off (event-name callback)
+  "Remove CALLBACK from EVENT-NAME listeners.
+EVENT-NAME should be a symbol. Callbacks are compared by identity (eq)."
+  (let ((listeners (gethash event-name amp--event-listeners)))
+    (when listeners
+      (puthash event-name (delq callback listeners) amp--event-listeners))))
+
+(defun amp--once (event-name callback)
+  "Register CALLBACK for EVENT-NAME, auto-removing after first call.
+The callback is removed after it fires once. Note that removal during
+an emit only affects future emits, not the current iteration."
+  (let ((wrapper nil))
+    (setq wrapper
+          (lambda (&rest args)
+            (amp--off event-name wrapper)
+            (apply callback args)))
+    (amp--on event-name wrapper)))
 
 (defun amp--emit (event-name &rest args)
   "Emit EVENT-NAME with ARGS to all registered listeners."
@@ -322,7 +356,7 @@ ROOT may be nil for non-project buffers, in which case default-directory is used
 (defun amp--project-broadcast-ide (state notification)
   "Broadcast NOTIFICATION to all clients of project STATE."
   (let ((json-message (json-encode notification)))
-    (dolist (ws (amp--project-state-clients state))
+    (dolist (ws (amp--session-state-clients state))
       (when (websocket-openp ws)
         (condition-case err
             (websocket-send-text ws json-message)
@@ -341,11 +375,19 @@ Resolves the project from the current buffer."
 
 (defun amp--on-client-connect (state ws)
   "Handle client connection for project STATE from WS."
-  (push ws (amp--project-state-clients state))
-  (setf (amp--project-state-connected state) t)
+  (push ws (amp--session-state-clients state))
+  (setf (amp--session-state-connected state) t)
   (amp--log 'info "server" "Client connected to project %s"
-            (amp--describe-project (amp--project-state-root state)))
+            (amp--describe-project (amp--session-state-root state)))
   (amp--emit 'client-connect ws)
+  (let ((event (make-amp-client-connection-event
+                :root (amp--session-state-root state))))
+    (condition-case err
+        (run-hook-with-args 'amp-client-connect-hook event)
+      (error
+       (amp--log 'error "hooks"
+                 "Error in amp-client-connect-hook: %s"
+                 (error-message-string err)))))
   (run-with-timer 0.05 nil
                   (lambda ()
                     (amp--send-initial-state-for-project state))))
@@ -357,13 +399,21 @@ Resolves the project from the current buffer."
 
 (defun amp--on-client-disconnect (state ws)
   "Handle client disconnection for project STATE from WS."
-  (setf (amp--project-state-clients state)
-        (delq ws (amp--project-state-clients state)))
-  (when (null (amp--project-state-clients state))
-    (setf (amp--project-state-connected state) nil)
+  (setf (amp--session-state-clients state)
+        (delq ws (amp--session-state-clients state)))
+  (when (null (amp--session-state-clients state))
+    (setf (amp--session-state-connected state) nil)
     (amp--log 'info "server" "Disconnected from Amp for project %s"
-              (amp--describe-project (amp--project-state-root state))))
-  (amp--emit 'client-disconnect ws))
+              (amp--describe-project (amp--session-state-root state))))
+  (amp--emit 'client-disconnect ws)
+  (let ((event (make-amp-client-connection-event
+                :root (amp--session-state-root state))))
+    (condition-case err
+        (run-hook-with-args 'amp-client-disconnect-hook event)
+      (error
+       (amp--log 'error "hooks"
+                 "Error in amp-client-disconnect-hook: %s"
+                 (error-message-string err))))))
 
 ;;; Selection Tracking
 
@@ -426,9 +476,9 @@ Works for both project buffers and non-project buffers (nil project)."
          (state (amp--get-project-state root))
          (selection (amp--get-current-selection)))
     (when (and state selection)
-      (let ((last (amp--project-state-latest-selection state)))
+      (let ((last (amp--session-state-latest-selection state)))
         (unless (equal selection last)
-          (setf (amp--project-state-latest-selection state) selection)
+          (setf (amp--session-state-latest-selection state) selection)
           (let ((ide-notification (amp--selection-to-ide-format selection)))
             (amp--project-broadcast-ide
              state
@@ -438,7 +488,7 @@ Works for both project buffers and non-project buffers (nil project)."
 
 (defun amp--update-selection-for-project (state)
   "Update and broadcast current selection for project STATE."
-  (let* ((root (amp--project-state-root state))
+  (let* ((root (amp--session-state-root state))
          (selection nil))
     (cl-block find-selection
       (dolist (window (window-list))
@@ -449,7 +499,7 @@ Works for both project buffers and non-project buffers (nil project)."
               (setq selection (amp--get-current-selection)))
             (cl-return-from find-selection)))))
     (when selection
-      (setf (amp--project-state-latest-selection state) selection)
+      (setf (amp--session-state-latest-selection state) selection)
       (let ((ide-notification (amp--selection-to-ide-format selection)))
         (amp--project-broadcast-ide
          state
@@ -485,13 +535,13 @@ ROOT may be nil for non-project files."
 
 (defun amp--broadcast-visible-files-for-project (state &optional force)
   "Broadcast visible files for project STATE if changed or FORCE is non-nil."
-  (let* ((root (amp--project-state-root state))
+  (let* ((root (amp--session-state-root state))
          (files (amp--get-visible-files-for-project root))
-         (last (amp--project-state-latest-visible-files state)))
+         (last (amp--session-state-latest-visible-files state)))
     (when (or force
               (not (equal (sort (copy-sequence files) #'string<)
                           (sort (copy-sequence (or last '())) #'string<))))
-      (setf (amp--project-state-latest-visible-files state) files)
+      (setf (amp--session-state-latest-visible-files state) files)
       (amp--project-broadcast-ide
        state
        (amp--wrap-notification
@@ -610,9 +660,9 @@ Returns an array of entries with uri and diagnostics."
   "Clean up all Amp servers on Emacs exit."
   (amp--map-projects
    (lambda (state)
-     (amp--remove-lockfile (amp--project-state-port state))
-     (when (amp--project-state-server state)
-       (websocket-server-close (amp--project-state-server state)))))
+     (amp--remove-lockfile (amp--session-state-port state))
+     (when (amp--session-state-server state)
+       (websocket-server-close (amp--session-state-server state)))))
   (clrhash amp--projects))
 
 ;;;###autoload
@@ -625,11 +675,11 @@ If not in a project, starts a server for non-project buffers."
     (when existing
       (user-error "Amp server already running for %s (port %d)"
                   (amp--describe-project root)
-                  (amp--project-state-port existing)))
+                  (amp--session-state-port existing)))
 
     (let* ((auth-token (amp--generate-auth-token))
            (port (+ 10000 (random 55535)))
-           (state (make-amp--project-state
+           (state (make-amp--session-state
                    :root root
                    :auth-token auth-token
                    :port port
@@ -654,7 +704,7 @@ If not in a project, starts a server for non-project buffers."
         (error
          (user-error "Failed to start Amp server: %s" (error-message-string err))))
 
-      (setf (amp--project-state-server state) server)
+      (setf (amp--session-state-server state) server)
 
       (condition-case err
           (amp--create-lockfile port auth-token root)
@@ -688,9 +738,9 @@ If not in a project, stops the server for non-project buffers."
     (unless state
       (user-error "No Amp server running for %s" (amp--describe-project root)))
 
-    (amp--remove-lockfile (amp--project-state-port state))
-    (when (amp--project-state-server state)
-      (websocket-server-close (amp--project-state-server state)))
+    (amp--remove-lockfile (amp--session-state-port state))
+    (when (amp--session-state-server state)
+      (websocket-server-close (amp--session-state-server state)))
     (amp--remove-project-state root)
     (amp--maybe-remove-hooks)
     (amp--maybe-remove-cleanup-hook)
@@ -705,9 +755,9 @@ If not in a project, stops the server for non-project buffers."
   (let ((count (hash-table-count amp--projects)))
     (amp--map-projects
      (lambda (state)
-       (amp--remove-lockfile (amp--project-state-port state))
-       (when (amp--project-state-server state)
-         (websocket-server-close (amp--project-state-server state)))))
+       (amp--remove-lockfile (amp--session-state-port state))
+       (when (amp--session-state-server state)
+         (websocket-server-close (amp--session-state-server state)))))
     (clrhash amp--projects)
     (amp--maybe-remove-hooks)
     (amp--maybe-remove-cleanup-hook)
@@ -726,8 +776,8 @@ With prefix argument ALL, show all running servers."
                      (push (cons (or root "")
                                  (format "  %s: port %d (%s)"
                                          (amp--describe-project root)
-                                         (amp--project-state-port state)
-                                         (if (amp--project-state-connected state)
+                                         (amp--session-state-port state)
+                                         (if (amp--session-state-connected state)
                                              "connected" "waiting")))
                            lines))
                    amp--projects)
@@ -739,8 +789,8 @@ With prefix argument ALL, show all running servers."
       (if state
           (message "Amp server for %s: port %d (%s)"
                    (amp--describe-project root)
-                   (amp--project-state-port state)
-                   (if (amp--project-state-connected state)
+                   (amp--session-state-port state)
+                   (if (amp--session-state-connected state)
                        "connected" "waiting"))
         (message "No Amp server running for %s" (amp--describe-project root))))))
 

@@ -100,6 +100,33 @@ M-x package-install RET websocket RET
 (amp-mode 1)
 #+end_src
 
+* Hooks
+
+The following hooks are available for responding to Amp CLI connection events:
+
+| Hook                          | Description                       |
+|-------------------------------+-----------------------------------|
+| =amp-client-connect-hook=     | Run when Amp CLI connects         |
+| =amp-client-disconnect-hook=  | Run when Amp CLI disconnects      |
+
+Hook functions receive an =amp-client-connection-event= struct with:
+- =root= — The project root path (string), or nil for non-project buffers
+
+Example: Send a context message when Amp connects:
+
+#+begin_src elisp
+(defun my-amp-send-context (event)
+  "Send project context to Amp when it connects."
+  (when-let ((root (amp-client-connection-event-root event)))
+    (amp-send-message
+     (format "Working in project: %s" root))))
+
+(add-hook 'amp-client-connect-hook #'my-amp-send-context)
+#+end_src
+
+Errors in hook functions are caught and logged to =*amp-log*=, preventing them
+from breaking connection handling.
+
 * Debugging
 
 View logs in the =*amp-log*= buffer to see connection status, selection changes,

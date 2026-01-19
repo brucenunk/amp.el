@@ -1,5 +1,13 @@
 # AGENT.md - Amp.el Development Guide
 
+## Git Workflow
+
+This repo doesn't use pull requests or branch protection. When finishing work:
+
+1. Merge your branch into the default branch locally
+2. Push the default branch directly
+3. Use `thats-a-wrap` to clean up the worktree
+
 ## Commands
 - **Development**: Load with `(load-file "amp.el")`, start server with `M-x amp-start`
 - **Testing**: Manual testing with `amp --ide` CLI integration
