@@ -218,6 +218,12 @@ ROOT may be nil for non-project buffers, in which case default-directory is used
       (when (file-exists-p lockfile-path)
         (delete-file lockfile-path)))))
 
+(defun amp--process-alive-p (pid)
+  "Return non-nil if a process with PID appears to be running.
+Returns nil if PID is nil or `process-attributes' is unavailable."
+  (when (and pid (fboundp 'process-attributes))
+    (ignore-errors (process-attributes pid))))
+
 ;;; Event System
 
 (defun amp--on (event-name callback)
@@ -827,6 +833,35 @@ With prefix argument ALL, show all running servers."
      (amp--wrap-notification `((appendToPrompt . ((message . ,text))))))
     (amp--log 'debug "message" "Text appended to prompt for %s"
               (amp--describe-project root))))
+
+;;;###autoload
+(defun amp-cleanup-stale-lockfiles ()
+  "Remove stale lockfiles from dead Emacs processes.
+Only removes lockfiles where `ideName' starts with \"Emacs\" (amp.el-created)
+and the referenced PID is no longer running. Safe to run multiple times.
+
+Note: This intentionally only cleans up Emacs-created lockfiles to avoid
+interfering with other IDE clients (e.g., amp.nvim)."
+  (interactive)
+  (let ((lock-dir (amp--lock-dir)))
+    (when (file-directory-p lock-dir)
+      (dolist (file (directory-files lock-dir t "\\.json\\'"))
+        (condition-case err
+            (let* ((json-object-type 'alist)
+                   (json-key-type 'symbol)
+                   (data (json-read-file file))
+                   (ide-name (alist-get 'ideName data))
+                   (pid (alist-get 'pid data)))
+              (when (and ide-name
+                         (string-prefix-p "Emacs" ide-name)
+                         (not (amp--process-alive-p pid)))
+                (delete-file file)
+                (amp--log 'info "cleanup" "Removed stale lockfile: %s (pid %s)"
+                          (file-name-nondirectory file) pid)))
+          (error
+           (amp--log 'debug "cleanup" "Failed to process lockfile %s: %s"
+                     (file-name-nondirectory file)
+                     (error-message-string err))))))))
 
 ;;;###autoload
 (define-minor-mode amp-mode
